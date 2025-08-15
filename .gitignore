@@ -1,0 +1,15 @@
+# 通用
+.DS_Store
+.vscode/ .idea/ .settings/
+*.tmp *.log *.bak
+
+# C/C++/构建产物
+*.o *.obj *.d *.map *.lst
+*.elf *.axf *.out *.bin *.hex
+build/ Debug/ debug/ Release/ release/ Objects/ Listings/
+
+# STM32CubeIDE / Keil 等
+*.ioc
+*.uvprojx *.uvoptx
+# J-Link logs
+JLinkLog.txt
