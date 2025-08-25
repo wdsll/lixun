@@ -115,6 +115,12 @@ extern "C"
 /* Logic Channel 1 */
 #define DMA_LOGIC_CH_1   ((uint8)1U)
 
+/* Logic Channel 2 */
+#define DMA_LOGIC_CH_2   ((uint8)2U)
+
+/* Logic Channel 3 */
+#define DMA_LOGIC_CH_3   ((uint8)3U)
+
 #define MCL_START_SEC_CONFIG_DATA_UNSPECIFIED
 /* @violates @ref Mcl_Dma_h_REF_1 MISRA 2012 Required Directive 4.10, Precautions shall be taken in order to prevent the contents of a header file being included more than once. */
 #include "Mcl_MemMap.h"
