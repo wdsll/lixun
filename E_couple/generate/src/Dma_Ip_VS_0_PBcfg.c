@@ -220,14 +220,14 @@ extern void Lpuart_3_Uart_Ip_DmaTxCompleteCallback(void);
 
 const Dma_Ip_LogicChannelConfigType LogicChannel0ConfigPB = 
 {
-		{
-				/* uint32 LogicChId; */               DMA_LOGIC_CH_0,
-				/* uint8 HwVersId; */                 DMA_IP_HARDWARE_VERSION_3,
-				/* uint8 HwInst; */                   DMA_IP_HW_INST_0,
-				/* uint8 HwChId; */                   0U,
-				/* Dma_Ip_Callback IntCallback; */    Lpuart_3_Uart_Ip_DmaTxCompleteCallback,
-				/* Dma_Ip_Callback ErrIntCallback; */ NULL_PTR,
-		}, /* Dma_Ip_LogicChannelIdType */
+                {
+                                /* uint32 LogicChId; */               DMA_LOGIC_CH_2,
+                                /* uint8 HwVersId; */                 DMA_IP_HARDWARE_VERSION_3,
+                                /* uint8 HwInst; */                   DMA_IP_HW_INST_0,
+                                /* uint8 HwChId; */                   2U,
+                                /* Dma_Ip_Callback IntCallback; */    Lpuart_3_Uart_Ip_DmaTxCompleteCallback,
+                                /* Dma_Ip_Callback ErrIntCallback; */ NULL_PTR,
+                }, /* Dma_Ip_LogicChannelIdType */
 		&LogicChannel0GlobalConfigPB,
 		NULL_PTR,
 		NULL_PTR,
@@ -237,14 +237,14 @@ extern void Lpuart_3_Uart_Ip_DmaRxCompleteCallback(void);
 
 const Dma_Ip_LogicChannelConfigType LogicChannel1ConfigPB = 
 {
-		{
-				/* uint32 LogicChId; */               DMA_LOGIC_CH_1,
-				/* uint8 HwVersId; */                 DMA_IP_HARDWARE_VERSION_3,
-				/* uint8 HwInst; */                   DMA_IP_HW_INST_0,
-				/* uint8 HwChId; */                   1U,
-				/* Dma_Ip_Callback IntCallback; */    Lpuart_3_Uart_Ip_DmaRxCompleteCallback,
-				/* Dma_Ip_Callback ErrIntCallback; */ NULL_PTR,
-		}, /* Dma_Ip_LogicChannelIdType */
+                {
+                                /* uint32 LogicChId; */               DMA_LOGIC_CH_3,
+                                /* uint8 HwVersId; */                 DMA_IP_HARDWARE_VERSION_3,
+                                /* uint8 HwInst; */                   DMA_IP_HW_INST_0,
+                                /* uint8 HwChId; */                   3U,
+                                /* Dma_Ip_Callback IntCallback; */    Lpuart_3_Uart_Ip_DmaRxCompleteCallback,
+                                /* Dma_Ip_Callback ErrIntCallback; */ NULL_PTR,
+                }, /* Dma_Ip_LogicChannelIdType */
 		&LogicChannel1GlobalConfigPB,
 		NULL_PTR,
 		NULL_PTR,
@@ -264,11 +264,11 @@ const Dma_Ip_LogicChannelConfigType * const Dma_Ip_paxLogicChannelConfigArrayPB[
 /* @violates @ref Mcl_Dma_h_REF_1 MISRA 2012 Required Directive 4.10, Precautions shall be taken in order to prevent the contents of a header file being included more than once. */
 #include "Mcl_MemMap.h"
 
-/* DMA Hardware Channel 0 */
-Dma_Ip_HwChannelStateType HwChannel0StatePB;
+/* DMA Hardware Channel 2 */
+Dma_Ip_HwChannelStateType HwChannel2StatePB;
 
-/* DMA Hardware Channel 1 */
-Dma_Ip_HwChannelStateType HwChannel1StatePB;
+/* DMA Hardware Channel 3 */
+Dma_Ip_HwChannelStateType HwChannel3StatePB;
 
 #define MCL_STOP_SEC_VAR_CLEARED_UNSPECIFIED_NO_CACHEABLE
 /* @violates @ref Mcl_Dma_h_REF_1 MISRA 2012 Required Directive 4.10, Precautions shall be taken in order to prevent the contents of a header file being included more than once. */
@@ -281,8 +281,8 @@ Dma_Ip_HwChannelStateType HwChannel1StatePB;
 /* DMA Hardware Channel State and DMA Logic Channel Configuration Array */
 Dma_Ip_HwChannelStateType * Dma_Ip_paxHwChannelStateArrayPB[DMA_IP_NOF_CFG_LOGIC_CHANNELS] =
 {
-		&HwChannel0StatePB,
-		&HwChannel1StatePB,
+                &HwChannel2StatePB,
+                &HwChannel3StatePB,
 };
 
 #define MCL_STOP_SEC_VAR_INIT_UNSPECIFIED_NO_CACHEABLE

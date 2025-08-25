@@ -102,11 +102,11 @@ int main(void)
 
     Dma_Ip_Init(&Dma_Ip_xDmaInitPB);
 
-    IP_DMAMUX_1->CHCFG[3]=0xA8;
-    IP_TCD->CH0_CSR=1;
+    IP_DMAMUX_1->CHCFG[2] = 0xA8U;
+    IP_TCD->CH2_CSR = 1U;
 
-    IP_DMAMUX_1->CHCFG[2]=0xA9;
-    IP_TCD->CH1_CSR=1;
+    IP_DMAMUX_1->CHCFG[3] = 0xA9U;
+    IP_TCD->CH3_CSR = 1U;
 
     eINITState = checkSbcInitState();
     printf("FS23 STATE is %s\r\n", eINITState == SBC_Init_INIT_STATE ? "INIT STATE" : (eINITState == SBC_Init_NON_INIT_STATE ? "Not INIT STATE" : "INVALID"));
