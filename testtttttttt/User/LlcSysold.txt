@@ -1,0 +1,2271 @@
+/*******************************************************************************
+ * LlcSys.c
+ * Dedicated
+ *  Created on: 2019-11-15
+ *      Author: Gavin.D
+*******************************************************************************/
+#include "LlcMain.h"
+
+/*******************************************************************************
+**                               宏定义
+*******************************************************************************/
+#define POWER_MAX  730000        ///720000   //系统设计最大功率,模拟值 700W是20位 2000瓦是21位，3.3Kw是22位
+#define IOUT_MAX   3000
+#define VOUT_MAX   350
+
+#define INIT_CHARGE_DATA {0, 0, 0, 0, 0, 0, 0, StepOne, eLlcSysCmdOff}
+
+#define AC_DERATING_VOL 1000
+#define AC_PROTECT_VOL  850
+#define AC_DERATING_VOL 1000
+
+#define TEMP_DERATING   2932//CYP 90度
+#define TEMP_PROTECT    3175//CYP100度
+
+//#define TEMP_DERATING   2478
+//#define TEMP_PROTECT    2792
+/*******************************************************************************
+**                               相关结构体
+*******************************************************************************/
+typedef enum{
+    SelfTest_State   = 0x00,
+    StandBy_State    = 0x01,
+    PulseOn_State    = 0x02,
+    ChargeOn_State   = 0x03,
+    Protection_State = 0x04,
+    ShutDown_State   = 0x05,
+    USBShutDown_State = 0x06,
+}SystemState;
+static SystemState gseSystemState;
+
+typedef enum{
+    StepOne   = 0x00,
+    StepTwo   = 0x01,
+    StepThree = 0x02,
+    StepFour  = 0x03,
+    StepFive  = 0x04,
+}StateStep;
+static StateStep gseStateStep = StepOne;
+
+Uint16 Switch_Step = StepOne;
+static Uint16 gsUSBShutDownFlag = 0;
+
+struct stCHARGESTATPARAM {
+    Uint16 ChargeMode;            // 充电机工作阶段模式
+    int16  ChargeCmdV;            // 充电机目标电压值、由充电曲线决定
+    int16  ChargeCmdI;            // 充电机目标电流值、由充电曲线决定
+    int16  ChargeSetI;            // 充电机目标电流值、由充电曲线决定，min(电流限制，CMDI)
+    Uint16 ChargeStartFlag;       // 充电阶段充电停机标志、准备进入浮充
+    Uint16 ChargeOffFlag;         // 充电阶段充电停机标志、准备进入浮充
+    Uint32 ChargeCnt;
+    StateStep ChargeStat;
+    eLlcSysCmd_t ChargeCmdOn;
+};
+static struct stCHARGESTATPARAM ChargeStateParam = INIT_CHARGE_DATA;
+
+struct sElecPara gstElecPara;
+stSetLlc_PARAM gstSetLlcPARAM;
+/*******************************************************************************
+**                               变量声明
+*******************************************************************************/
+static Uint16 gsStateDelay = 0;
+static Uint16 gsStateOver = 1;//0
+static Uint16 gsStateCnt = 0;
+static Uint16 gsChargeCnt = 0;
+static Uint16 gsVolBatCompVal = 0;
+static Uint16 gsChargeOffFlag = 0;
+static Uint16 Chargerestart = 0;
+Uint16 ChargeOffFlag=0;
+Uint16 ChargeState = 0;
+Uint16 CHargeState1 =0;
+Uint16 EQ_MFlag = 0;  /*testmode EQ_MFlag = 1*/               //EQ 模式开启
+Uint16 EQ_WriteFlag = 0;
+Uint16 Key1s_Flag = 0;
+Uint16 Key5s_Flag = 0;
+
+static int16 gsSelfCounter = 0;
+static Uint32 gsSwitchCounter = 0;
+Uint16 gCurve[17] = {2,7,10,11,100,101,102,103,104};
+Uint16 gCurveNum = 1;
+Uint16 Curve_Max = 9;
+Uint16 gSelfState = 0;
+Uint16 DisplayOff = 0;
+
+extern Uint16 restart;
+extern Uint16 Bat_Voltage;
+//预充阶段充电信息：电流电压指令，跳转电压和时间
+int32 PRECHARGECMI = PRECHARGECMI_1;                                 //指令电流0.05C
+int32 PRECHARGECMV = PRECHARGECMV_1;                                   //指令电压电池总电压
+int32 PRECHARGEENDV =PRECHARGEENDV_1 ;     //预充结束电池总电压
+int32 PRECHARGEENDCNT = PRECHARGEENDCNT_1;                                 //预充结束时间2H
+//恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+int32 CONCURCHARGECMI = CONCURCHARGECMI_1;                                //指令电流0.167C
+int32 CONCURCHARGECMV = CONCURCHARGECMV_1;                                //指令电压电池总电压
+int32 CONCURCHARGEENDI = CONCURCHARGEENDI_1;
+int32 CONCURCHARGEENDV =CONCURCHARGEENDV_1 ;                       //恒流结束电池总电压
+int32 CONCURCHARGEENDCNT =CONCURCHARGEENDCNT_1;
+//恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+int32 SCONCURCHARGECMI =SCONCURCHARGECMI_1 ;                                //指令电流0.1C
+int32 SCONCURCHARGECMV =SCONCURCHARGECMV_1 ;                               //指令电压电池总电压
+int32 SCONCURCHARGEENDV = SCONCURCHARGEENDV_1;                         //恒流结束电池总电压
+int32 SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_1 ;                      //恒流结束时间2H
+//恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+int32 CONVOLCHARGECMI = CONVOLCHARGECMI_1;                                 //指令电流0.06C
+int32 CONVOLCHARGECMV = CONVOLCHARGECMV_1;                               //指令电压电池总电压
+int32 CONVOLCHARGEENDI = CONVOLCHARGEENDI_1;                                    //恒压结束电池总电流
+int32 CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_1;                                        //恒压结束时间2H
+//涓流充电阶段充电信息：电流电压指令，跳转时间
+int32 BCONVOLCHARGECMI =BCONVOLCHARGECMI_1 ;                                   //指令电流0.01C
+int32 BCONVOLCHARGECMV = BCONVOLCHARGECMV_1;                               //指令电压电池总电压
+int32 BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_1 ;         //恒流结束电池总电压
+int32 BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_1;                                          //恒压结束时间2H
+//浮充阶段充电信息：电流电压指令，跳转时间
+int32 FLOATCHARGECMI = FLOATCHARGECMI_1;                                   //指令电流0.01C
+int32 FLOATCHARGECMV =FLOATCHARGECMV_1 ;                                   //指令电压电池总电压
+int32 FLOATCHARGEENDCNT = FLOATCHARGECMV_1;                                        //预充结束时间4H
+/*EQ阶段*/
+int32 EQCHARGECMI  = EQCurrCMD_1;
+int32 EQCHARGECMV  = EQVoltCMD_1;
+int32 EQCHARGETIME = EQTimeCMD_1;
+/*******************************************************************************
+**                               函数声明
+*******************************************************************************/
+void InitSysPara(void);
+void ElecParaCal(void);
+void SystemManage(void);
+
+static void SysTimer(void);
+static void ReFreshCurve(void);
+static void SelfTestState(void);
+static void StandByState(void);
+static void PulseOnState(void);
+static void ChargeOnState(void);
+static void ProtectionState(void);
+static void ShutDownState(void);
+static void USBShutDownState(void);
+
+static void TestFlashManage(void);
+static void TestFailManage(void);
+
+static void SelectCurve(void);
+static void ChargeStartStateTest(void);
+
+static void PreChargeManage(void);
+static void ConCurChargeManage(void);
+static void SConCurChargeManage(void);
+static void ConVolChargeManage(void);
+static void BConVolChargeManage(void);
+static void FloatChargeManage(void);
+static void EQChargeManage(void);
+static void PAUSEChargeManage(void);
+static int32 InputPowerLimiting(int16 InputFeed);
+static int16 TempPowerLimiting(int16 TempFeed);
+static int32 PowerLimiting(void);
+static int16 RenewCurrentLmiting();
+
+Uint16 GetLedIndex(void);
+
+/*******************************************************************************
+** 函数名称:    AdcDataInit
+** 函数功能:    初始化ADC采样相关数据
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+void InitSysPara(void)
+{
+    gstElecPara.OutVol = 0;
+    gstElecPara.BatVol = 0;
+    gstElecPara.OutCur = 0;
+    gstElecPara.PfcVoltSet = 0;
+    gstElecPara.ACInCur = 0;
+    gstElecPara.ACInVol = 0;
+
+    gstSetLlcPARAM.LlcTargetCur = 0;
+    gstSetLlcPARAM.LlcTargetVol = 0;
+    gstSetLlcPARAM.llcOnCommand = eLlcSysCmdOff;
+
+    gseSystemState = SelfTest_State;
+
+    gsStateDelay = 0;
+
+    gsPFCUploadData.PFCAcInCrt = 0;
+    gsPFCUploadData.PFCAcInFrq = 0;
+    gsPFCUploadData.PFCAcInVolt = 0;
+    gsPFCUploadData.PFCBusVolt = 0;
+    gsPFCUploadData.PFCCmdSts = 0;
+    gsPFCUploadData.PFCErr = 0;
+    gsPFCUploadData.PFCSubSts = 0;
+    gsPFCUploadData.PFCTemp = 0;
+    gsPFCUploadData.PFCWorkSts = 0;
+}
+
+/*******************************************************************************
+** 函数名称:    ElecParaCal
+** 函数功能:    计算所有电参数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+void ElecParaCal(void)
+{
+    gstElecPara.OutVol = ((int32)VOUT_DATA * K_VOUT_A + K_VOUT_B) >> K_EXP;
+    gstElecPara.BatVol = ((int32)BAT_DATA * K_VBAT_A + K_VBAT_B) >> K_EXP;
+    gsVolBatCompVal = gstElecPara.BatVol;
+    if(Line_Loss_Vol < 6)
+    {
+        gstElecPara.OutVol -= Line_Loss_Vol;
+        gstElecPara.BatVol -= Line_Loss_Vol;
+    }
+    else
+    {
+        gstElecPara.OutVol -= 6;
+        gstElecPara.BatVol -= 6;
+    }
+    ////
+    /// gstElecPara.BatVol += gstSetLlcPARAM.LlcTempCompenVol;
+    ///gstElecPara.OutVol -= gstSetLlcPARAM.LlcTempCompenVol;
+    //gstElecPara.BatVol = gstElecPara.OutVol;
+    gstElecPara.OutCur = ((int32)IOUT_DATA * K_IOUT_A + K_IOUT_B) >> K_EXP;
+    if(gstElecPara.OutVol < 0)
+    {
+        gstElecPara.OutVol = 0;
+    }
+    if(gstElecPara.BatVol < 0)
+    {
+        gstElecPara.BatVol = 0;
+    }
+    if(gstElecPara.OutCur < 0)
+    {
+        gstElecPara.OutCur = 0;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    SystemManage
+** 函数功能:    系统管理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+Uint16 keycount = 0;
+void SystemManage(void)
+{
+    ReFreshCurve();
+    gsChargeOffFlag = ChargeOffFlag;
+    Bat_Voltage = gstElecPara.BatVol;
+    SysTimer();
+    if((SelfTest_State != gseSystemState)&&(ShutDown_State != gseSystemState)
+            &&(USBShutDown_State != gseSystemState)&&(!DeBug))
+    {
+        CheckErr();
+        if(SysErr.all)
+        {
+            gseSystemState = Protection_State;
+        }
+    }
+    switch(gseSystemState)
+    {
+        case SelfTest_State:
+            SelfTestState();
+            break;
+        case StandBy_State:
+            StandByState();
+            break;
+        case PulseOn_State:
+            PulseOnState();
+            break;
+        case ChargeOn_State:
+            ChargeOnState();
+            break;
+        case Protection_State:
+            if(0 == GpioDataRegs.GPBDAT.bit.GPIO32)
+            {
+                SelfTestState();
+                gseSystemState =  SelfTest_State;
+            }
+             ProtectionState();
+            break;
+        case ShutDown_State:
+            ShutDownState();
+            break;
+        case USBShutDown_State:
+            USBShutDownState();
+            break;
+        default:
+            break;
+    }
+    ChargeState = gseSystemState;
+    CHargeState1 = gseStateStep;
+    gstSetLlcPARAM.llcOnCommand = ChargeStateParam.ChargeCmdOn;
+    gstSetLlcPARAM.LlcTargetCur = (((int32)ChargeStateParam.ChargeSetI << K_EXP) - K_IOUT_B) / K_IOUT_A;
+    gstSetLlcPARAM.LlcTargetVol = (((int32)ChargeStateParam.ChargeCmdV << K_EXP) - K_VBAT_B) / K_VBAT_A;
+}
+/*******************************************************************************
+ *函数名: ReFreshCurve();
+ *功能描述:任意状态下更新充电曲线:且不影响当前运行状态
+ *功能描述:任意状态下更新充电曲线:且不影响当前运行状态
+ * *****************************************************************************/
+void ReFreshCurve()
+{
+    Uint16 TempData = 0;
+    if(GpioDataRegs.GPBDAT.bit.GPIO32 == 0 && SelfTest_State != gseSystemState && 0 == GpioDataRegs.GPADAT.bit.GPIO19)
+    {
+        keycount ++;
+        gsSwitchCounter = 0;
+/*        if(keycount > 300 && keycount < 3000)
+        {
+            gSelfState = 6;
+        }*/
+        if(keycount > 3000 && keycount <= 7000)
+        {
+            if(Key5s_Flag)
+                gSelfState = 5;
+            else
+            {
+                gSelfState = 5;
+                TempData = ReadByte(0);
+                if(TempData <= Curve_Max && TempData > 0)
+                {
+                    gCurveNum = TempData;
+                }
+            }
+        }
+        if(keycount > 8000 && keycount < 15000)
+        {
+            gSelfState = 3;
+/*            TempData = ReadByte(11);
+            if(TempData != 256 &&  TempData != 0)
+            {*/
+                if(0 == EQ_MFlag)
+                {
+                   EQ_MFlag = 1;
+                }
+                else
+                {
+                    EQ_MFlag = 0;
+                }
+                keycount = 15000;
+                gSelfState = 3;
+           // }
+        }
+        if(keycount >= 15000)
+        {
+/*            if(WriteByte(11 , EQ_MFlag))*/
+            {
+                gSelfState = 3;
+            }
+        }
+        if(keycount > 20000)
+            keycount = 0;
+    }
+    else if(keycount > 200 && keycount < 3000 && SelfTest_State != gseSystemState && 0 == GpioDataRegs.GPADAT.bit.GPIO19)
+    {
+        if(1 == Key5s_Flag)
+        {
+            Key1s_Flag = 1;
+        }
+        if(1 == Key1s_Flag)
+        {
+            Key1s_Flag = 0;
+            gCurveNum ++;
+            if(gCurveNum > Curve_Max)//4
+             {
+               gCurveNum = 1;
+             }
+             gSelfState = 1;
+        }
+        keycount = 0;
+    }
+    else if(keycount > 3000 && keycount < 7000 && SelfTest_State != gseSystemState && 0 == GpioDataRegs.GPADAT.bit.GPIO19)
+    {
+            gSelfState = 5;
+            if(0 == Key5s_Flag)
+            {
+                Key5s_Flag = 1;
+                keycount = 0;
+            }
+            else
+            {
+                Key5s_Flag = 2;
+                if(WriteByte(0 , gCurveNum))
+                {
+                    gSelfState = 0;
+                    Key1s_Flag = 0;
+                    Key5s_Flag = 0;
+                    keycount = 0;
+                    gsSwitchCounter = 0;
+                    gseStateStep = StepOne;
+                    gseSystemState = ShutDown_State;///SelfTest_State;///StandBy_State;///ShutDown_State
+                    restart = 1;
+                }
+            }
+    }
+    else if(1 == GpioDataRegs.GPADAT.bit.GPIO19)
+    {
+        gsSwitchCounter = 0;
+        gSelfState = 6;
+        ChargeOffFlag = 0;
+        gsChargeOffFlag = 0;
+        restart = 1;
+        if(0 == GpioDataRegs.GPBDAT.bit.GPIO32)
+        {
+            keycount ++;
+            if(keycount > 1000)
+            {
+                keycount = 1000;
+                DisplayOff = 1;
+            }
+        }
+        else
+        {
+            if(keycount < 1)
+            {
+                keycount = 0;
+                DisplayOff = 0;
+            }
+            else
+            {
+                keycount --;
+            }
+        }
+    }
+    else if(0 == GpioDataRegs.GPADAT.bit.GPIO19 && 6 == gSelfState && gsPFCUploadData.PFCAcInVolt > 700)
+    {
+        gSelfState = 4;
+        gseStateStep = StepFour;
+        gseSystemState = ShutDown_State;
+        restart = 1;
+    }
+    else
+    {
+        gsSwitchCounter++;
+        if(gsSwitchCounter > 10000)
+        {
+            gSelfState = 0;
+            Key1s_Flag = 0;
+            Key5s_Flag = 0;
+            gsSwitchCounter = 0;
+        }
+          DisplayOff = 0;
+          keycount = 0;
+    }
+    /*待定*/
+/*    if(1 == ChargeOffFlag && 0 == GpioDataRegs.GPADAT.bit.GPIO19)
+        gSelfState = 7;*/
+}
+/*******************************************************************************
+** 函数名称:    SelfTestState
+** 函数功能:    自检状态处理,含按键检测，前5秒若是检测到按键连续按1秒，则选择曲线，数码管滚动显示，连续按1秒，则确定曲线编号
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+void SelfTestState(void)
+{
+    Uint16 temp = 256;
+    if(gCurveNum > Curve_Max && ADRESULT_USBON < 1000 && 1 == USBON)
+        gCurveNum = 1;
+    gstSetLlcPARAM.llcOnCommand = eLlcSysCmdOff;
+    switch(gseStateStep)
+    {
+        case StepOne:
+           // gSelfState = 1;
+            gsSelfCounter ++;
+            if(gsSelfCounter > 5000)
+            {
+                gCurveNum = ReadByte(0);
+                if(gCurveNum != 256)
+                {
+                    gsSelfCounter = 0;
+                    gSelfState = 2;
+                    gseStateStep = StepTwo;
+                }
+            }
+            if(GpioDataRegs.GPBDAT.bit.GPIO32 == 0)
+            {
+                gsSwitchCounter ++;
+                if(gsSwitchCounter > 1000)
+                {
+                    gCurveNum = ReadByte(0);
+                    if(gCurveNum != 256)
+                    {
+                        gseStateStep = StepThree;
+                        gsSwitchCounter = 0;
+                        gsSelfCounter = 0;
+                        gSelfState = 3;
+                    }
+                }
+            }
+            else
+            {
+                gsSwitchCounter = 0;
+            }
+            /*
+            gsSelfCounter ++;
+            if(gsSelfCounter < 1000)
+            {
+                temp = ReadByte(11);
+                if(temp != 256)
+                {
+                    EQ_MFlag = temp;
+                }
+            }
+            if(gsSelfCounter > 5000)
+            {
+                if(0 == Key5s_Flag)
+                {
+                    temp = ReadByte(0);
+                    if(temp > 0 && temp <= Curve_Max)//255
+                    {
+                        gCurveNum = temp;
+                        gsSelfCounter = 0;
+                        gSelfState = 4;
+                        gseStateStep = StepTwo;
+                    }
+                    else if(gsSelfCounter > 7000)
+                    {
+                        gsSelfCounter = 0;
+                        gCurveNum = 1;
+                        gsSelfCounter = 0;
+                        gSelfState = 4;
+                        gseStateStep = StepTwo;
+                    }
+                }
+                else
+                {
+                    gsSelfCounter = 0;
+                    gSelfState = 4;
+                    gseStateStep = StepTwo;
+                  //  Key5s_Flag = 0;
+                }
+            }
+            if(GpioDataRegs.GPBDAT.bit.GPIO32 == 0)
+            {
+                if(0 == Key5s_Flag)
+                {
+                    temp = ReadByte(0);
+                    if(temp <= Curve_Max && temp > 0)
+                    {
+                        gCurveNum = temp;
+                    }
+                }
+                gsSwitchCounter ++;
+                if(gsSwitchCounter > 500)
+                {
+                   gseStateStep = StepThree;
+                   gsSelfCounter = 0;
+                   gsSwitchCounter = 0;
+                   gSelfState = 1;
+                }
+            }
+            */
+
+            break;
+        case StepTwo:
+            TestFlashManage();
+            if(0 == gsStateDelay)
+            {
+                gSelfState = 4;
+                gseStateStep = StepOne;
+                gseSystemState = StandBy_State;
+                Key5s_Flag = 0;
+            }
+            else
+            {
+                if(Key5s_Flag)
+                {
+                    if(WriteByte(0 , gCurveNum))
+                    {
+                        EQ_WriteFlag = 0;
+                        Key5s_Flag = 0;
+                        gsStateDelay = 0;
+                    }
+                }
+            }
+            break;
+        case StepThree:
+            if(GpioDataRegs.GPBDAT.bit.GPIO32 == 0)
+            {
+                gsSelfCounter ++;
+                if(gsSelfCounter > 2000 && gsSelfCounter < 7000)
+                {
+                    if(1 == Key5s_Flag)
+                    {
+                        if(WriteByte(0 , gCurveNum))
+                        {
+                            gSelfState = 5;
+                        }
+                    }
+                    if(0 == Key5s_Flag)
+                    {
+                        gSelfState = 5;
+                    }
+                }
+                if(gsSelfCounter > 70000)
+                {
+                    gSelfState = 3;
+                    Key1s_Flag = 0;
+/*                    temp = ReadByte(11);
+                    if(temp != 256 && 0 != 0)
+                    {*/
+                        Key5s_Flag = 0;
+                        if(0 == EQ_MFlag)
+                        {
+                           EQ_MFlag = 1;
+                        }
+                        else
+                        {
+                            EQ_MFlag = 0;
+                        }
+                        gseStateStep = StepTwo;
+                        gsStateDelay = 2000;
+                        gsSelfCounter = 0;
+                        gSelfState = 3;
+                  //  }
+                }
+                else if(gsSelfCounter > 13000)
+                {
+                   gseStateStep = StepTwo;
+                   gsStateDelay = 2000;
+                   gsSelfCounter = 0;
+                   gSelfState = 1;
+                }
+                gsSwitchCounter = 0;
+            }
+            else
+            {/*松开*/
+                gsSwitchCounter ++;
+                if(gsSelfCounter >= 100 && gsSelfCounter <= 2000)
+                {
+                    if(0 == Key5s_Flag || 2 == Key5s_Flag)
+                    {
+                        Key1s_Flag = 0;
+                    }
+                    else if(1 == Key5s_Flag )
+                    {
+                        Key1s_Flag = 1;
+                        gsSelfCounter = 0;
+                    }
+                }
+                else if(gsSelfCounter > 2000 && gsSelfCounter <= 10000)
+                {
+                    if(0 == Key5s_Flag )
+                    {
+                            gSelfState = 1;
+                            Key1s_Flag = 0;
+                            Key5s_Flag = 1;
+                            gseStateStep = StepOne;
+                            gsSelfCounter = 0;
+                     }
+                    else if(1 == Key5s_Flag)
+                    {
+                         Key5s_Flag = 2;
+                    }
+                }
+                else if(gsSelfCounter > 10000)
+                {
+                    Key1s_Flag = 0;
+                    if(0 == EQ_MFlag)
+                           EQ_MFlag = 1;
+                    else
+                           EQ_MFlag = 0;
+                    gseStateStep = StepTwo;
+                    gsStateDelay = 2000;
+                    gsSelfCounter = 0;
+                    gSelfState = 3;
+                }
+                else
+                {
+                    gsSelfCounter = 0;
+                }
+            }
+            if(1 == Key1s_Flag)
+            {
+                gseStateStep = StepFour;
+                gsSelfCounter = 0;
+                gSelfState = 1;
+            }
+            else if(2 == Key5s_Flag)
+            {
+                if(WriteByte(0 , gCurveNum))
+                {
+                  gseStateStep = StepTwo;
+                  gsStateDelay = 2000;
+                  gsSelfCounter = 0;
+                  gSelfState = 4;
+                  Key5s_Flag = 0;
+                }
+            }
+            if(gsSwitchCounter > 8000)
+            {
+                if(Key5s_Flag)
+                {
+                    if(WriteByte(0 , gCurveNum))
+                    {
+                        gsSwitchCounter = 0;
+                        gseStateStep = StepTwo;
+                        gsStateDelay = 2000;
+                        gsSelfCounter = 0;
+                        gSelfState = 3;
+                        Key1s_Flag = 0;
+                        Key5s_Flag = 0;
+                    }
+                }
+            }
+            break;
+        case StepFour:/*松开*/
+                if(1 == Key1s_Flag)
+                {
+                    Key1s_Flag = 0;
+                    gsSelfCounter = 0;
+                    gCurveNum ++;
+                    if(gCurveNum > Curve_Max)//4
+                    {
+                        gCurveNum = 1;
+                    }
+                    gSelfState = 1;
+                    gseStateStep = StepThree;
+                }
+            break;
+        default:
+           // TestFailManage();
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    StandByState
+** 函数功能:    待机状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void StandByState(void)
+{
+    gstSetLlcPARAM.llcOnCommand = eLlcSysCmdOff;
+    switch(gseStateStep)
+    {
+        case StepOne:
+            SelectCurve();
+            CLR_KPOUT;
+            if(0 == ChargeOffFlag)
+                SET_KPIN;
+/*            else
+                CLR_KPIN;*/
+            PFC_ON;
+            gsStateDelay = 100;
+            gseStateStep = StepTwo;
+            break;
+        case StepTwo:
+            if(0 == gsStateDelay)
+            {
+             /*   if(labs(gsPFCUploadData.PFCBusVolt - gstElecPara.PfcVoltSet) < 100 || gCurveNum == 5 || gCurveNum == 7 || gCurveNum == 8 || gCurveNum == 9)
+                {                                                                            //// || gCurveNum == 2 || gCurveNum == 9 ||gCurveNum == 10 ||gCurveNum == 12 || gCurveNum == 11|| gCurveNum == 13
+                    gsStateCnt ++;
+                    if(gsStateCnt > 5000)
+                    {
+                        gsStateCnt = 0;
+                        /////2020 0824 test
+                        if(gstElecPara.BatVol < 180 || 1 == restart)
+                         {
+                            gsChargeOffFlag = 0;
+                            Chargerestart = 0;
+                            ChargeOffFlag = 0;
+                            ///restart = 0;
+                         }
+                            gseStateStep = StepOne;
+                            gseSystemState = PulseOn_State;
+                            SET_KPAW;
+                    }
+                }
+                ////////test////
+                else*/ if(((gstElecPara.BatVol < 200 && 1 == gsChargeOffFlag)|| (0 == gsChargeOffFlag) || 1 == restart)&&(gstElecPara.BatVol > 35))
+                {
+                    gsStateCnt ++;
+                    if(gsStateCnt > 5000)
+                    {
+                        gsChargeOffFlag = 0;
+                        Chargerestart = 0;
+                        ChargeOffFlag = 0;
+                        gseStateStep = StepOne;
+                        gseSystemState = PulseOn_State;
+//                        SET_KPAW;
+                    }
+                }//////////2020 0824
+                else
+                {
+                    gsStateCnt = 0;
+                }
+            }
+            break;
+        case StepThree:
+            if((gstElecPara.BatVol < FLOATCHARGECMV)&&(gstElecPara.BatVol > 35))/*120*/
+            {
+                gstElecPara.PfcVoltSet = 3850;
+                CLR_KPOUT;
+                if(0 == ChargeOffFlag)
+                    SET_KPIN;
+/*                else
+                    CLR_KPIN;*/
+                PFC_ON;
+                gsStateDelay = 100;
+                gseStateStep = StepTwo;
+             }
+            break;
+        case StepFour:///////restart
+            if((gstElecPara.BatVol < 180 || 1 == restart)&&(gstElecPara.BatVol > 35))
+            {
+                gsStateCnt ++;
+                if(gsStateCnt > 1000)
+                {
+                    SelectCurve();
+                    gsChargeOffFlag = 0;
+                    Chargerestart = 0;
+                    ChargeOffFlag = 0;
+                    gstElecPara.PfcVoltSet = 3850;
+                    CLR_KPOUT;
+                    if(0 == ChargeOffFlag)
+                        SET_KPIN;
+/*                    else
+                        CLR_KPIN;*/
+                    PFC_ON;
+                    if(GpioDataRegs.GPADAT.bit.GPIO19 == 0)
+                    {
+                        gseSystemState =  SelfTest_State;
+                        gseStateStep = StepTwo;
+                    }
+                }
+            }
+            else
+                gsStateCnt = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    PulseOnState
+** 函数功能:    启动状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void PulseOnState(void)
+{
+    switch(gseStateStep)
+    {
+        case StepOne:
+            if(gsChargeOffFlag != 1)
+            {
+                if(WriteEEPStart())   //充电开始前记录充电开始的数据，等待
+                {
+                    gseStateStep = StepTwo;
+                    PauseOnFlag = 1;
+                }
+            }
+            else
+            {
+                gseStateStep = StepTwo;
+            }
+            break;
+        case StepTwo:
+            gsStateDelay = 100;
+            gsStateOver  = 60000;  //60S
+            ChargeStateParam.ChargeCmdV = gstElecPara.BatVol;//240;//
+            ChargeStateParam.ChargeCmdI = 5;
+            ChargeStateParam.ChargeCmdOn = eLlcSysCmdOn;
+            gseStateStep = StepThree;
+            break;
+        case StepThree:
+            ChargeStateParam.ChargeCmdOn = eLlcSysCmdOn;
+            if(0 == gsStateOver)
+            {
+                SysErr.bit.HardwareErr = 1;
+            }
+            if((gstElecPara.OutVol > (gstElecPara.BatVol - 20))&&(gstElecPara.OutVol <= 300))
+            {
+                PauseOnFlag = 0;
+                ChargeStateParam.ChargeCmdOn = eLlcSysCmdOff;
+                gseStateStep = StepFour;
+                gsStateCnt = 0;
+            }
+            else
+            {
+                gsStateCnt = 0;
+            }
+            break;
+        case StepFour:
+            if(1 == Chargerestart)
+            {
+                ChargeStateParam.ChargeMode = CHGSTAT_FLOATCHARGE;
+                ChargeStateParam.ChargeCmdV = FLOATCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                ChargeStateParam.ChargeCmdI = FLOATCHARGECMI;
+            }
+            else if(gsChargeOffFlag != 1)
+            {
+                ChargeStartStateTest();
+            }
+
+            SET_KPOUT;
+            gseStateStep = StepOne;
+            gseSystemState = ChargeOn_State;
+            break;
+        default:
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    ChargeOnState
+** 函数功能:    充电状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+int16 tmpCurLimit = 0;
+int16 tmpCurLimitTest = 0;
+static void ChargeOnState(void)
+{
+    ChargeStateParam.ChargeCmdOn = eLlcSysCmdOn;
+    switch(ChargeStateParam.ChargeMode)
+    {
+        case CHGSTAT_PRECHARGE:
+             PreChargeManage();
+             break;
+        case CHGSTAT_CONCURCHARGE:
+             ChargeStartStateTest();
+             ConCurChargeManage();
+             break;
+        case CHGSTAT_SCONCURCHARGE:
+             SConCurChargeManage();
+             break;
+        case CHGSTAT_CONVOLCHARGE:
+             ConVolChargeManage();
+             break;
+        case CHGSTAT_BCONVOLCHARGE:
+             BConVolChargeManage();
+             break;
+        case CHGSTAT_FLOATCHARGE:
+             FloatChargeManage();
+             break;
+        case CHGSTAT_EQMODECHARGE:
+             EQChargeManage();
+             break;
+        case CHGSTAT_PAUSEMODE:
+             PAUSEChargeManage();
+             break;
+        default:
+             break;
+    }
+    tmpCurLimit = RenewCurrentLmiting();
+    //tmpCurLimit = IOUT_MAX;
+    ChargeStateParam.ChargeSetI = min(ChargeStateParam.ChargeCmdI,tmpCurLimit);
+}
+
+/*******************************************************************************
+** 函数名称:    ProtectionState
+** 函数功能:    保护状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void ProtectionState(void)
+{
+    ChargeStateParam.ChargeCmdOn = eLlcSysCmdShutDown;
+    if((gstElecPara.OutCur < 100)||(0 == gsStateDelay))
+    {
+        CLR_KPOUT;
+        PFC_OFF;
+    }
+    CheckErr();
+    if(0 == SysErr.all)
+    {
+        gseStateStep = StepOne;
+        gseSystemState = StandBy_State;
+    }
+    WriteEEPErr();
+}
+
+/*******************************************************************************
+** 函数名称:    ShutDownState
+** 函数功能:    关机状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void ShutDownState(void)
+{
+    ChargeStateParam.ChargeCmdOn = eLlcSysCmdOff;
+    switch(gseStateStep)
+    {
+        case StepOne:
+//            CLR_KPAW;
+            gsStateDelay = 1000;
+            ChargeStateParam.ChargeCmdV = 0;
+            ChargeStateParam.ChargeCmdI = 0;
+            gseStateStep = StepTwo;
+            break;
+        case StepTwo:
+            if((gstElecPara.OutCur < 100)||(0 == gsStateDelay))
+            {
+                CLR_KPOUT;
+                PFC_OFF;
+                gseStateStep = StepThree;
+            }
+            break;
+        case StepThree:
+            if(WriteEEPStop())
+            {
+                gseStateStep = StepOne;//StepThree
+                gseSystemState = StandBy_State;
+/*                if(gCurveNum == 5 || gCurveNum == 7 || gCurveNum == 8 || gCurveNum == 9)
+                    Chargerestart = 1;
+                else
+                {
+                    gsChargeOffFlag = 1;
+                    ChargeOffFlag = 1;
+                    DC_EN;
+                }*/
+            }
+            break;
+        case StepFour:///////restart
+            if(((gstElecPara.BatVol < 180) || 1 == restart)&&(gstElecPara.BatVol > 35))
+            {
+                SelectCurve();
+                gsChargeOffFlag = 0;
+                Chargerestart = 0;
+                ChargeOffFlag = 0;
+                gstElecPara.PfcVoltSet = 3850;
+                CLR_KPOUT;
+                if(0 == ChargeOffFlag)
+                    SET_KPIN;
+                PFC_ON;
+                gseSystemState =  StandBy_State;
+                gseStateStep = StepOne;//StepTwo
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    ShutDownState
+** 函数功能:    关机状态处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+Uint16 StepUSBDown = 0;
+Uint16 GoToUSBShutDown(void)
+{
+    if(!StepUSBDown)
+    {
+        gseSystemState = USBShutDown_State;
+        gseStateStep = StepOne;
+        StepUSBDown = 1;
+    }
+    return(gsUSBShutDownFlag);
+}
+void GoToUSBChargeOn(void)
+{
+    gseSystemState = USBShutDown_State;
+    gseStateStep = StepFour;
+    StepUSBDown = 0;
+}
+
+static void USBShutDownState(void)
+{
+    ChargeStateParam.ChargeCmdOn = eLlcSysCmdOff;
+    switch(gseStateStep)
+    {
+        case StepOne:
+            gsUSBShutDownFlag = 0;
+            gsStateDelay = 1000;
+            ChargeStateParam.ChargeCmdV = 0;
+            ChargeStateParam.ChargeCmdI = 0;
+            gseStateStep = StepTwo;
+            break;
+        case StepTwo:
+            gsUSBShutDownFlag = 0;
+            if((gstElecPara.OutCur < 100)||(0 == gsStateDelay))
+            {
+                CLR_KPOUT;
+                PFC_OFF;
+                gseStateStep = StepThree;
+            }
+            break;
+        case StepThree:
+            gsUSBShutDownFlag = 1;
+            break;
+        case StepFour:
+            gsUSBShutDownFlag = 0;
+            gseStateStep = StepOne;
+            gseSystemState = StandBy_State;
+            break;
+        default:
+            break;
+    }
+}
+
+
+/*******************************************************************************
+** 函数名称:    SysTimer
+** 函数功能:    系统定时器处理
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+Uint16 g1sCnt = 0;
+Uint32 gAllChargeTime = 0;
+Uint32 gAllChargeAH = 0;
+static void SysTimer(void)
+{
+    if(gsStateDelay)
+    {
+        gsStateDelay --;
+    }
+    if(gsStateOver)
+    {
+        gsStateOver --;
+    }
+    g1sCnt ++;
+    if(g1sCnt > 1000)
+    {
+        g1sCnt = 0;
+        if(ChargeOn_State == gseSystemState)
+        {
+            gAllChargeTime ++;
+            gAllChargeAH +=  gstElecPara.OutCur;
+        }
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    TestFlashManage
+** 函数功能:    Flash检测处理函数,暂时为空
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void TestFlashManage(void)
+{
+    ;
+}
+
+/*******************************************************************************
+** 函数名称:    TestFailManage
+** 函数功能:    自检子状态[自检失败]处理函数,保持自检状态,自检失败置位
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void TestFailManage(void)
+{
+ ///   CLR_KPIN;/////2020 0822 为了做standby 待机状态位
+    PFC_OFF;
+    CLR_KPOUT;
+    SysErr.bit.HardwareErr = 1;
+}
+
+/*******************************************************************************
+** 函数名称:    SelectCurve
+** 函数功能:    根据读取的曲线编号更换曲线
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void SelectCurve(void)
+{
+    switch(gCurveNum)
+    {
+        case 0:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_1;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_1;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_1;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_1;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_1;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_1;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_1;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_1;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_1 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_1;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_1;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_1;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_1;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_1;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_1;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_1;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_1;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_1;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_1;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_1;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_1;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_1;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_1;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_1;
+            EQCHARGECMV  = EQVoltCMD_1;
+            EQCHARGETIME = EQTimeCMD_1;
+            break;
+        case 1:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_1;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_1;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_1 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_1;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_1;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_1;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_1;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_1;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_1 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_1 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_1;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_1 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_1;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_1;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_1;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_1;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_1 ;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_1;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_1 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_1;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_1;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_1 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_1;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_1;
+            EQCHARGECMV  = EQVoltCMD_1;
+            EQCHARGETIME = EQTimeCMD_1;
+            break;
+        case 2:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_2;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_2;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_2 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_2;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_2;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_2;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_2;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_2 ;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_2 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_2 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_2;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_2 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_2;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_2;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_2;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_2;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_2 ;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_2;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_2 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_2;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_2;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_2 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_2;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_2;
+            EQCHARGECMV  = EQVoltCMD_2;
+            EQCHARGETIME = EQTimeCMD_2;
+            break;
+        case 3:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_3;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_3;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_3;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_3;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_3;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_3;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_3;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_3;                         //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_3;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_3;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_3;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_3 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_3;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_3;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_3;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_3;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_3 ;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_3;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_3 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_3;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_3;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_3 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_3;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_3;
+            EQCHARGECMV  = EQVoltCMD_3;
+            EQCHARGETIME = EQTimeCMD_3;
+            break;
+        case 4:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_4;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_4;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_4 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_4;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_4;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_4;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_4;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_4 ;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_4 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_4 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_4;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_4;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_4;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_4;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_4;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_4;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_4 ;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_4;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_4 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_4;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_4;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_4 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_4;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_4;
+            EQCHARGECMV  = EQVoltCMD_4;
+            EQCHARGETIME = EQTimeCMD_4;
+            break;
+        case 5:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_5;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_5;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_5 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_5;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_5;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_5;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_5;
+
+            CONCURCHARGEENDV =CONCURCHARGEENDV_5 ;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_5 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_5 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_5;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_5 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_5;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_5;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_5;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_5;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_5 ;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_5;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_5 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_5;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_5;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_5 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_5;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_5;
+            EQCHARGECMV  = EQVoltCMD_5;
+            EQCHARGETIME = EQTimeCMD_5;
+            break;
+        case 6:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_6;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_6;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_6 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_6;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_6;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_6;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_6;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_6;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_6 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_6 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_6;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_6 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_6;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_6;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_6;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_6;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_6;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_6;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_6;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_6;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_6;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_6;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_6;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_6;
+            EQCHARGECMV  = EQVoltCMD_6;
+            EQCHARGETIME = EQTimeCMD_6;
+            break;
+        case 7:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_7;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_7;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_7 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_7;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_7;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_7;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_7;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_7;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_7;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_7;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_7;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_7;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_7;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_7;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_7;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_7;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_7;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_7;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_7;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_7;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_7;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_7;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_7;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_7;
+            EQCHARGECMV  = EQVoltCMD_7;
+            EQCHARGETIME = EQTimeCMD_7;
+            break;
+        case 8:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_8;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_8;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_8;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_8;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_8;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_8;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_8;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_8;                         //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_8;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_8;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_8;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_8;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_8;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_8;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_8;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_8;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_8;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_8;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_8;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_8;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_8;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_8;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_8;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_8;
+            EQCHARGECMV  = EQVoltCMD_8;
+            EQCHARGETIME = EQTimeCMD_8;
+            break;
+        case 9:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_9;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_9;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_9;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_9;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_9;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_9;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_9;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_9;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_9;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_9;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_9;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_9;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_9;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_9;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_9;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_9;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_9;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_9;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_9;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_9;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_9;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_9;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_9;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_9;
+            EQCHARGECMV  = EQVoltCMD_9;
+            EQCHARGETIME = EQTimeCMD_9;
+            break;
+        case 10:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_10;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_10;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_10;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_10;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_10;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_10;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_10;
+
+            CONCURCHARGEENDV =CONCURCHARGEENDV_10;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_10;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_10;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_10;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_10;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_10;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_10;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_10;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_10;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_10;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_10;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_10;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_10;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_10;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_10;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_10;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_10;
+            EQCHARGECMV  = EQVoltCMD_10;
+            EQCHARGETIME = EQTimeCMD_10;
+            break;
+        case 11:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_11;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_11;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_11;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_11;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_11;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_11;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_11;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_11;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_11;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_11;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_11;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_11;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_11;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_11;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_11;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_11;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI = BCONVOLCHARGECMI_11;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_11;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV = BCONVOLCHARGEENDV_11;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_11;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_11;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_11;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_11;                                        //预充结束时间4H
+            ///EQ充电阶段信息：电流时间电压上限
+            EQCHARGECMI  = EQCurrCMD_11;
+            EQCHARGECMV  = EQVoltCMD_11;
+            EQCHARGETIME = EQTimeCMD_11;
+            break;
+        case 12:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_12;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_12;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_12 ;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_12;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_12;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_12;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_12;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_12 ;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_12 ;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_12 ;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_12;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_12 ;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_12;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_12;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_12;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_12;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_12;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_12;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_12 ;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_12;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_12;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_12 ;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_12;                                        //预充结束时间4H
+            break;
+        case 13:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_13;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_13;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_13;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_13;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_13;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_13;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_13;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_13;                         //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_13;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_13;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_13;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_13;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_13;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_13;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_13;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_13;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_13;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_13;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_13;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_13;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_13;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_13;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_13;                                        //预充结束时间4H
+            break;
+        case 14:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_1;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_1;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_1;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_1;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_1;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_1;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_1;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_1;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_1;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_1;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_1;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_1;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_1;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_1;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_1;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_1;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_1;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_1;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_1;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_1;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_1;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_1;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_1;                                        //预充结束时间4H
+            break;
+        case 15:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_1;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_1;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_1;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_1;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_1;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_1;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_1;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_1;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_1;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_1;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_1;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_1;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_1;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_1;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_1;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_1;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_1;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_1;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_1;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_1;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_1;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_1;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_1;                                        //预充结束时间4H
+            break;
+        default:
+            //预充阶段充电信息：电流电压指令，跳转电压和时间
+            PRECHARGECMI = PRECHARGECMI_2;                                 //指令电流0.05C
+            PRECHARGECMV = PRECHARGECMV_2;                                   //指令电压电池总电压
+            PRECHARGEENDV =PRECHARGEENDV_2;     //预充结束电池总电压
+            PRECHARGEENDCNT = PRECHARGEENDCNT_2;                                 //预充结束时间2H
+            //恒流充电一阶段充电信息：电流电压指令，跳转电压和跳转时间在程序里计算
+            CONCURCHARGECMI = CONCURCHARGECMI_2;                                //指令电流0.167C
+            CONCURCHARGECMV = CONCURCHARGECMV_2;                                //指令电压电池总电压
+            CONCURCHARGEENDI = CONCURCHARGEENDI_2;
+            CONCURCHARGEENDV =CONCURCHARGEENDV_2;                        //恒流结束电池总电压
+            //恒流充电二阶段充电信息：电流电压指令，跳转电压和时间
+            SCONCURCHARGECMI =SCONCURCHARGECMI_2;                                //指令电流0.1C
+            SCONCURCHARGECMV =SCONCURCHARGECMV_2;                               //指令电压电池总电压
+            SCONCURCHARGEENDV = SCONCURCHARGEENDV_2;                          //恒流结束电池总电压
+            SCONCURCHARGEENDCNT =SCONCURCHARGEENDCNT_2;                                        //恒流结束时间2H
+            //恒压充电阶段充电信息：电流电压指令，跳转电流和时间
+            CONVOLCHARGECMI = CONVOLCHARGECMI_2;                                 //指令电流0.06C
+            CONVOLCHARGECMV = CONVOLCHARGECMV_2;                               //指令电压电池总电压
+            CONVOLCHARGEENDI = CONVOLCHARGEENDI_2;                                    //恒压结束电池总电流
+            CONVOLCHARGEENDCNT = CONVOLCHARGEENDCNT_2;                                        //恒压结束时间2H
+            //涓流充电阶段充电信息：电流电压指令，跳转时间
+            BCONVOLCHARGECMI =BCONVOLCHARGECMI_2;                                   //指令电流0.01C
+            BCONVOLCHARGECMV = BCONVOLCHARGECMV_2;                               //指令电压电池总电压
+            BCONVOLCHARGEENDV =BCONVOLCHARGEENDV_2;          //恒流结束电池总电压
+            BCONVOLCHARGEENDCNT = BCONVOLCHARGEENDCNT_2;                                          //恒压结束时间2H
+            //浮充阶段充电信息：电流电压指令，跳转时间
+            FLOATCHARGECMI = FLOATCHARGECMI_2;                                   //指令电流0.01C
+            FLOATCHARGECMV =FLOATCHARGECMV_2;                                   //指令电压电池总电压
+            FLOATCHARGEENDCNT = FLOATCHARGECMV_2;                                        //预充结束时间4H
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    ChargeStateTest
+** 函数功能:    初始充电状态检测函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void ChargeStartStateTest(void)
+{
+    if(gstElecPara.OutVol <= PRECHARGEENDV)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_PRECHARGE;
+        ChargeStateParam.ChargeCmdV = PRECHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = PRECHARGECMI;
+    }
+    else if(gstElecPara.OutVol <= CONCURCHARGEENDV)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_CONCURCHARGE;
+        ChargeStateParam.ChargeCmdV = CONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = CONCURCHARGECMI;
+    }
+    else if(gstElecPara.OutVol < SCONCURCHARGEENDV)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_SCONCURCHARGE;
+        ChargeStateParam.ChargeCmdV = SCONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = SCONCURCHARGECMI;
+    }
+    else if(gstElecPara.OutVol < BCONVOLCHARGEENDV)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_BCONVOLCHARGE;
+        ChargeStateParam.ChargeCmdV = BCONVOLCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = BCONVOLCHARGECMI;
+    }
+    else
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_PRECHARGE;
+        ChargeStateParam.ChargeCmdV = PRECHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = PRECHARGECMI;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    PreChargeManage
+** 函数功能:    预充状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void PreChargeManage(void)
+{
+    switch(ChargeStateParam.ChargeStat)
+    {
+        case StepOne:
+            gsVolBatCompVal = gstElecPara.BatVol + BATCELLS;
+            ChargeStateParam.ChargeStat = StepTwo;
+            break;
+        case StepTwo:
+            ChargeStateParam.ChargeCnt ++;
+            if(ChargeStateParam.ChargeCnt > PRECHARGEENDCNT)
+            {
+                /*if(gstElecPara.BatVol < gsVolBatCompVal)
+                {
+                    SysErr.bit.BatErr = 1;
+                }
+                else
+                {*/
+                    ChargeStateParam.ChargeMode = CHGSTAT_CONCURCHARGE;
+                    ChargeStateParam.ChargeCmdV = CONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                    ChargeStateParam.ChargeCmdI = CONCURCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+                //}
+            }
+            if((gstElecPara.BatVol) > (PRECHARGEENDV - gstSetLlcPARAM.LlcTempCompenVol))
+            {
+                gsChargeCnt ++;
+                if(gsChargeCnt > 100)
+                {
+                    ChargeStateParam.ChargeMode = CHGSTAT_CONCURCHARGE;
+                    ChargeStateParam.ChargeCmdV = CONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;//;;
+                    ChargeStateParam.ChargeCmdI = CONCURCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+                }
+            }
+            else
+            {
+                gsChargeCnt = 0;
+            }
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    ConCurChargeManage
+** 函数功能:    恒流一状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void ConCurChargeManage(void)
+{
+    switch(ChargeStateParam.ChargeStat)
+    {
+        case StepOne:
+            gsVolBatCompVal = gstElecPara.BatVol + 2 * BATCELLS;
+            ChargeStateParam.ChargeStat = StepTwo;
+            break;
+        case StepTwo:
+            ChargeStateParam.ChargeCnt ++;
+            if(ChargeStateParam.ChargeCnt > CONCURCHARGEENDCNT)
+            {
+                /*if(gstElecPara.BatVol < gsVolBatCompVal)
+                {
+                    SysErr.bit.BatErr = 1;
+                }
+                else
+                {*/
+                    ChargeStateParam.ChargeMode = CHGSTAT_SCONCURCHARGE;
+                    ChargeStateParam.ChargeCmdV = SCONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                    ChargeStateParam.ChargeCmdI = SCONCURCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+                //}
+            }
+            if((gstElecPara.BatVol) > (CONCURCHARGEENDV - gstSetLlcPARAM.LlcTempCompenVol))
+            {
+                gsChargeCnt ++;
+                if(gsChargeCnt > 100)
+                {
+                    ChargeStateParam.ChargeMode = CHGSTAT_SCONCURCHARGE;
+                    ChargeStateParam.ChargeCmdV = SCONCURCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                    ChargeStateParam.ChargeCmdI = SCONCURCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+                }
+            }
+            else
+            {
+                gsChargeCnt = 0;
+            }
+            break;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    SConCurChargeManage
+** 函数功能:    恒流二状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void SConCurChargeManage(void)
+{
+    switch(ChargeStateParam.ChargeStat)
+    {
+        case StepOne:
+            gsVolBatCompVal = gstElecPara.BatVol;
+            ChargeStateParam.ChargeStat = StepTwo;
+            break;
+        case StepTwo:
+            ChargeStateParam.ChargeCnt ++;
+            if(ChargeStateParam.ChargeCnt > SCONCURCHARGEENDCNT)
+            {
+                    ChargeStateParam.ChargeMode = CHGSTAT_CONVOLCHARGE;
+                    ChargeStateParam.ChargeCmdV = CONVOLCHARGECMV  - gstSetLlcPARAM.LlcTempCompenVol;
+                    ChargeStateParam.ChargeCmdI = CONVOLCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+            }
+            if((gstElecPara.BatVol) > (SCONCURCHARGEENDV - gstSetLlcPARAM.LlcTempCompenVol))
+            {
+                gsChargeCnt ++;
+                if(gsChargeCnt > 100)
+                {
+                    ChargeStateParam.ChargeMode = CHGSTAT_CONVOLCHARGE;
+                    ChargeStateParam.ChargeCmdV = CONVOLCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                    ChargeStateParam.ChargeCmdI = CONVOLCHARGECMI;
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepOne;
+                    ChargeStateParam.ChargeCnt = 0;
+                }
+            }
+            else
+            {
+                gsChargeCnt = 0;
+            }
+            break;
+    }
+}
+/*******************************************************************************
+** 函数名称:    ConVolChargeManage
+** 函数功能:    恒压状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void ConVolChargeManage(void)
+{
+    ChargeStateParam.ChargeCnt ++;
+    if(ChargeStateParam.ChargeCnt > CONVOLCHARGEENDCNT)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_BCONVOLCHARGE;
+        ChargeStateParam.ChargeCmdV = BCONVOLCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = BCONVOLCHARGECMI;
+        gsChargeCnt = 0;
+        ChargeStateParam.ChargeCnt = 0;
+    }
+    if(gstElecPara.OutCur < CONVOLCHARGEENDI)
+    {
+        gsChargeCnt ++;
+        if(gsChargeCnt > 100)
+        {
+            ChargeStateParam.ChargeMode = CHGSTAT_BCONVOLCHARGE;
+            ChargeStateParam.ChargeCmdV = BCONVOLCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+            ChargeStateParam.ChargeCmdI = BCONVOLCHARGECMI;
+            gsChargeCnt = 0;
+            ChargeStateParam.ChargeCnt = 0;
+        }
+    }
+    else
+    {
+        gsChargeCnt = 0;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    BConVolChargeManage
+** 函数功能:    涓流状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void BConVolChargeManage(void)
+{
+    switch(ChargeStateParam.ChargeStat)
+    {
+        case StepOne:
+            gsVolBatCompVal = gstElecPara.BatVol + BATCELLS;
+            ChargeStateParam.ChargeStat = StepTwo;
+            break;
+        case StepTwo:
+            ChargeStateParam.ChargeCnt ++;
+            if(ChargeStateParam.ChargeCnt > BCONVOLCHARGEENDCNT)
+            {
+                /*if(gstElecPara.BatVol < gsVolBatCompVal)
+                {
+                    SysErr.bit.BatErr = 1;
+                }
+                else
+                {*/
+/*                    if(gCurveNum%2 ! = 1)
+                        CLR_KPOUT;*/
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepThree;
+                    ChargeStateParam.ChargeCnt = 0;
+                //}
+            }
+            if((((gstElecPara.BatVol) > (BCONVOLCHARGEENDV ))///- gstSetLlcPARAM.LlcTempCompenVol
+                && (1== gCurveNum || 2== gCurveNum || 3== gCurveNum || 4== gCurveNum || 5== gCurveNum || 6== gCurveNum  || 7== gCurveNum|| 9== gCurveNum))
+                || (gstElecPara.OutCur < BCONVOLCHARGEENDI_8 && 8 == gCurveNum))
+            {
+                gsChargeCnt ++;
+                if(gsChargeCnt > 100)
+                {
+                    gsChargeCnt = 0;
+                    ChargeStateParam.ChargeStat = StepThree;
+                    ChargeStateParam.ChargeCnt = 0;
+                }
+            }
+            else
+            {
+                gsChargeCnt = 0;
+            }
+            break;
+        case StepThree:
+            if(1 == EQ_MFlag)
+            {
+                ChargeStateParam.ChargeMode = CHGSTAT_EQMODECHARGE;
+                ChargeStateParam.ChargeCmdV = EQCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+                ChargeStateParam.ChargeCmdI = EQCHARGECMI;
+/*
+ int32 EQCHARGECMI  = EQCurrCMD_1;
+int32 EQCHARGECMV  = EQVoltCMD_1;
+int32 EQCHARGETIME = EQTimeCMD_1;
+*/
+                /*                gsChargeOffFlag = 1;
+                ChargeOffFlag = 1;
+                DC_EN;
+                ChargeStateParam.ChargeStat = StepOne;
+                gseSystemState = ShutDown_State;
+                gseStateStep = StepOne;
+                CLR_KPOUT;*/
+            }
+            else
+            {
+                gsChargeOffFlag = 1;
+                ChargeOffFlag = 1;
+                DC_EN;
+                ChargeStateParam.ChargeStat = StepOne;
+                gseSystemState = ShutDown_State;
+                gseStateStep = StepOne;
+                CLR_KPOUT;
+            }
+            break;
+        default:
+            break;
+    }
+}
+/******************************************************************************
+ 函数名称:EQChargeManage();
+ EQ模式充电仅仅在每月初开始允许
+ EQ模式使用以后本月讲不在开启;
+ 另外还可以通过手动按钮讲EQ标志符合修改;
+ * ****************************************************************************/
+static void EQChargeManage(void)
+{
+    ChargeStateParam.ChargeCnt++;
+    if(ChargeStateParam.ChargeCnt > EQCHARGETIME)
+    {
+        EQ_MFlag = 0;
+/*        if(WriteByte(11,EQ_MFlag))
+        {*/
+            ChargeStateParam.ChargeStat = StepOne;
+            gseSystemState = ShutDown_State;
+            gseStateStep = StepFour;
+            gsChargeOffFlag = 1;
+            ChargeOffFlag = 1;
+            DC_EN;
+ //       }
+    }
+}
+/******************************************************************************
+ 函数名称:PAUSEChargeManage();
+ 仅仅在预充阶段有效
+用于打嗝处理
+ * ****************************************************************************/
+static void PAUSEChargeManage(void)
+{
+
+}
+/*******************************************************************************
+** 函数名称:    FloatChargeManage
+** 函数功能:    浮充状态函数
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+static void FloatChargeManage(void)
+{
+    ChargeStateParam.ChargeCnt ++;
+    if(ChargeStateParam.ChargeCnt > FLOATCHARGEENDCNT && 0 == EQ_MFlag)
+    {
+        ChargeStateParam.ChargeStat = StepOne;
+        gseSystemState = ShutDown_State;
+        gseStateStep = StepFour;
+        gsChargeOffFlag = 1;
+        ChargeOffFlag = 1;
+        DC_EN;
+    }
+    else if(1 == EQ_MFlag)
+    {
+        ChargeStateParam.ChargeMode = CHGSTAT_EQMODECHARGE;
+        ChargeStateParam.ChargeCmdV = EQCHARGECMV - gstSetLlcPARAM.LlcTempCompenVol;
+        ChargeStateParam.ChargeCmdI = EQCHARGECMI;
+    }
+}
+
+/*******************************************************************************
+** 函数名称:    InputPowerLimiting
+** 函数功能:    受输入影响的功率限制值计算
+** 形式参数:    输入反馈,系统设计最大允许功率
+** 返回参数:    根据输入反馈得到的系统当前允许的最大功率值
+*******************************************************************************/
+static int32 InputPowerLimiting(int16 InputFeed)
+{
+    int32 tmpInputPowerLimiting = 0;
+    tmpInputPowerLimiting = InputFeed * 7;
+    return (tmpInputPowerLimiting);
+}
+
+/*******************************************************************************
+** 函数名称:    InputPowerLimiting
+** 函数功能:    受输入影响的功率限制值计算
+** 形式参数:    输入反馈,系统设计最大允许功率
+** 返回参数:    根据输入反馈得到的系统当前允许的最大功率值
+*******************************************************************************/
+static int16 TempPowerLimiting(int16 TempFeed)
+{
+    int16 tmpDeratingRate;
+
+    if(TempFeed >= TEMP_PROTECT)
+    {
+        tmpDeratingRate = 0;
+    }
+    else if(TempFeed <= TEMP_DERATING)
+    {
+        tmpDeratingRate = 128;
+    }
+    else
+    {
+        tmpDeratingRate = (int32)(TEMP_PROTECT - TempFeed) * 128 / (TEMP_PROTECT - TEMP_DERATING);
+    }
+    return (tmpDeratingRate);
+}
+
+/*******************************************************************************
+** 函数名称:    PowerLmiting
+** 函数功能:    功率限制函数,根据当前的输入电压、温度计算当前系统允许的最大输出功率
+** 形式参数:    无
+** 返回参数:    无
+*******************************************************************************/
+int32 PowerLimiting(void)
+{
+    int32 tmpMaxPwr;
+    int16 tmpDeratingRate;
+    tmpMaxPwr = POWER_MAX;
+    if(gsPFCUploadData.PFCAcInVolt < AC_DERATING_VOL)
+    {
+        tmpMaxPwr = (int32)gsPFCUploadData.PFCAcInVolt * 700;
+    }
+    if(TEMP_DATA > TEMP_DERATING)
+    {
+        tmpDeratingRate = TempPowerLimiting(TEMP_DATA);
+        tmpMaxPwr = (tmpMaxPwr * tmpDeratingRate)>>7;
+    }
+    return (tmpMaxPwr);
+}
+
+/*******************************************************************************
+** 函数名称:    RenewCurrentLmiting
+** 函数功能:    根据当前系统最大允许输出功率与当前输出电压,计算当前允许的最大输
+**              出电流,并与系统设计最大电流比较,较小值用作系统输出的最大允许指令值
+** 形式参数:    当前系统最大允许功率,当前电流指令,当前输出电压反馈值
+** 返回参数:    计算得到的当前最大允许电流
+*******************************************************************************/
+static int16 RenewCurrentLmiting()
+{
+    int16 tmpMaxCur;
+    int32 tmpMaxPwr;
+    tmpMaxPwr = PowerLimiting();
+    if(gstElecPara.BatVol > 35)/*120*/
+    {
+        tmpMaxCur = tmpMaxPwr / gstElecPara.BatVol;
+    }
+    else
+    {
+        tmpMaxCur = IOUT_MAX;
+    }
+    if(tmpMaxCur > IOUT_MAX)
+    {
+        tmpMaxCur = IOUT_MAX;
+    }
+    else if(tmpMaxCur < 0)
+    {
+        tmpMaxCur = 0;
+    }
+    return (tmpMaxCur);
+}
+
+/*******************************************************************************
+** 函数名称:    GetLedIndex
+** 函数功能:    LED处理函数:获取当前LED指示状态
+** 形式参数:    无
+** 返回参数:    当前的LED显示索引，如下define，该define放在这个位置
+*******************************************************************************/
+#define LED_NO_ACTION_INDEX   0
+#define LED_ONE_FLASH_INDEX   1
+#define LED_TWO_FLASH_INDEX   2
+#define LED_THREE_FLASH_INDEX 3
+#define LED_FOUR_FLASH_INDEX  4
+#define LED_ALL_ON_INDEX      5
+#define LED_ALL_FLASH_INDEX   6
+
+Uint16 GetLedIndex(void)
+{
+    Uint16 tmpIndex = LED_NO_ACTION_INDEX;
+    switch(gseSystemState)
+    {
+        case SelfTest_State:
+            tmpIndex = LED_ALL_ON_INDEX;
+            break;
+        case StandBy_State:
+            tmpIndex = LED_ALL_ON_INDEX;
+            break;
+        case PulseOn_State:
+            tmpIndex = LED_ONE_FLASH_INDEX;
+            break;
+        case ChargeOn_State:
+            switch(ChargeStateParam.ChargeMode)
+            {
+                case CHGSTAT_PRECHARGE:
+                    tmpIndex = LED_ONE_FLASH_INDEX;
+                    break;
+                case CHGSTAT_CONCURCHARGE:
+                    tmpIndex = LED_TWO_FLASH_INDEX;
+                    break;
+                case CHGSTAT_SCONCURCHARGE:
+                    tmpIndex = LED_THREE_FLASH_INDEX;
+                    break;
+                case CHGSTAT_CONVOLCHARGE:
+                    tmpIndex = LED_FOUR_FLASH_INDEX;
+                    break;
+                case CHGSTAT_BCONVOLCHARGE:
+                    tmpIndex = LED_FOUR_FLASH_INDEX;
+                    break;
+                case CHGSTAT_FLOATCHARGE:
+                    tmpIndex = LED_ALL_ON_INDEX;
+                    break;
+                default:
+                     break;
+            }
+            break;
+        case Protection_State:
+            tmpIndex = LED_ALL_FLASH_INDEX;
+            break;
+        case ShutDown_State:
+            tmpIndex = LED_ALL_ON_INDEX;
+            break;
+        default:
+            break;
+    }
+    return(tmpIndex);
+}
