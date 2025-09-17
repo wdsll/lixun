@@ -1,21 +1,19 @@
-
 /*
  * demo_pfc_llc.c
- * Minimal demo for GD32F303 controlling a two?stage supply:
+ * Minimal demo for GD32F303 controlling a two-stage supply:
  * - Stage 1: NCP1654 PFC (GPIO enable + ADC monitor of VBUS)
  * - Stage 2: Full-bridge/LLC driven by TIMER0 complementary PWM via NSI6602B
  *
- * Notes:
- * - Pin mapping is EXAMPLE ONLY ¡ª adjust to your PCB.
- * - Dead-time set ~500 ns at 120 MHz (DTG = 60).
- * - DIS of NSI6602B is active HIGH to force-off; we drive it LOW to enable.
- * - Simple state machine with soft-start and fault latch.
+ * This version runs the power stage in a deterministic open-loop mode.
+ * Feedback is only used for coarse safety monitoring; no regulation is
+ * attempted once the system is running.
  */
 
 #include "gd32f30x.h"
 #include <stdio.h>
 #include <math.h>
 #include "bsp_SysTicks.h"
+
 /* ===================== User Config ===================== */
 #define SYSCLK_HZ           120000000UL
 
@@ -30,7 +28,7 @@
 #define VBUS_GPIO_RCU       RCU_GPIOC
 
 /* Divider: VBUS -> Rtop -> node(PC0) -> Rbot -> GND
-   Example: Rtop=1.0M, Rbot=4.99k  => scale = (Rtop+Rbot)/Rbot ¡Ö 201
+   Example: Rtop=1.0M, Rbot=4.99k  => scale = (Rtop+Rbot)/Rbot  â‰ˆ201
    Replace with your real values */
 #define VBUS_SCALE          (201.0f)
 
@@ -69,27 +67,26 @@
 #define DUTY_RAMP_STEP      (0.005f)     /* per control tick */
 #define CTRL_TICK_HZ        (2000U)      /* 2 kHz background control loop */
 
+#define PFC_STARTUP_DELAY_MS   (50U)
+#define DRIVER_ENABLE_DELAY_MS (5U)
+#define OPEN_LOOP_MONITOR_MS   (10U)
+#define DUTY_MAX_CLAMP         (0.95f)
+
 /* ======================================================= */
 
 static void clock_config(void);
 static void gpio_config(void);
 static void adc_config(void);
 static void timer0_pwm_fullbridge_init(uint32_t pwm_hz, uint32_t deadtime_ns, float duty);
+static void timer0_update_duty(float duty);
+static void open_loop_softstart(void);
 static uint16_t adc_read_vbus_raw(void);
 static float    vbus_read_volts(void);
 static void     delay_ms(uint32_t ms);
 
-/* Simple state machine */
-typedef enum {
-    SYS_OFF = 0,
-    SYS_WAIT_VBUS_READY,
-    SYS_SOFTSTART,
-    SYS_RUN,
-    SYS_FAULT
-} sys_state_t;
-
-static volatile sys_state_t g_state = SYS_OFF;
 static volatile float g_duty = DUTY_START;
+static volatile float g_vbus_monitor = 0.0f;
+static uint32_t g_timer_period = 0U;
 
 int main(void)
 {
@@ -97,98 +94,74 @@ int main(void)
     gpio_config();
     adc_config();
 
-    /* Ensure everything off */
-    gpio_bit_reset(PFC_EN_GPIO, PFC_EN_PIN);    /* PFC disabled */
-    gpio_bit_reset(NSI_DIS_GPIO, NSI_DIS_PIN);  /* default LOW enables driver; we will keep disabled initially */
-    gpio_bit_set(NSI_DIS_GPIO, NSI_DIS_PIN);    /* keep driver disabled during bring-up */
+    /* Ensure everything off before configuring */
+    gpio_bit_reset(PFC_EN_GPIO, PFC_EN_PIN);
+    gpio_bit_reset(NSI_DIS_GPIO, NSI_DIS_PIN);
+    gpio_bit_set(NSI_DIS_GPIO, NSI_DIS_PIN);    /* hold driver disabled */
 
-    /* Set up PWM but keep outputs idle until RUN */
+    /* Set up PWM but keep outputs idle until the open-loop ramp begins */
     timer0_pwm_fullbridge_init(PWM_FREQ_HZ, DEADTIME_NS, DUTY_START);
 
-    /* Start control tick using SysTick */
+    /* Start SysTick based delay helpers */
     systick_delay_config();
 
-    g_state = SYS_WAIT_VBUS_READY;
+    /* Bring up power stages using fixed timing instead of feedback */
+    delay_ms(PFC_STARTUP_DELAY_MS);
+    gpio_bit_set(PFC_EN_GPIO, PFC_EN_PIN);          /* enable PFC */
+    delay_ms(DRIVER_ENABLE_DELAY_MS);
+    gpio_bit_reset(NSI_DIS_GPIO, NSI_DIS_PIN);      /* enable driver (active low) */
+
+    /* Execute a deterministic soft-start ramp */
+    open_loop_softstart();
 
     while (1) {
-        float vbus = vbus_read_volts();
+        g_vbus_monitor = vbus_read_volts();
 
-        switch (g_state) {
-        case SYS_WAIT_VBUS_READY:
-            /* Enable PFC and wait until bus rises > VBUS_OK_MIN_V */
-            gpio_bit_set(PFC_EN_GPIO, PFC_EN_PIN);
-            if (vbus > VBUS_OK_MIN_V) {
-                /* Enable gate driver and proceed to soft-start */
-                gpio_bit_reset(NSI_DIS_GPIO, NSI_DIS_PIN); /* LOW = enable */
-                g_state = SYS_SOFTSTART;
+        if (g_vbus_monitor > VBUS_OVP_V || g_vbus_monitor < VBUS_UVP_V) {
+            /* Simple safety shutdown; open-loop control does not attempt recovery */
+            gpio_bit_reset(PFC_EN_GPIO, PFC_EN_PIN);
+            gpio_bit_set(NSI_DIS_GPIO, NSI_DIS_PIN);
+            while (1) {
+                delay_ms(OPEN_LOOP_MONITOR_MS);
             }
-            break;
-
-        case SYS_SOFTSTART:
-            /* Ramp duty to target */
-            if (g_duty < DUTY_TARGET) {
-                g_duty += DUTY_RAMP_STEP;
-                if (g_duty > DUTY_TARGET) g_duty = DUTY_TARGET;
-                /* Update compare on both channels */
-                uint32_t timer_clk = SYSCLK_HZ;
-                uint32_t period = (timer_clk / PWM_FREQ_HZ) - 1U;
-                uint32_t pulse = (uint32_t)((period + 1U) * g_duty);
-                timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_0, pulse);
-                timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_1, pulse);
-            } else {
-                g_state = SYS_RUN;
-            }
-            /* fallthrough */
-        case SYS_RUN:
-            /* Runtime protections */
-            if (vbus > VBUS_OVP_V || vbus < VBUS_UVP_V) {
-                g_state = SYS_FAULT;
-            }
-            break;
-
-        case SYS_FAULT:
-            /* Latch off */
-            gpio_bit_reset(PFC_EN_GPIO, PFC_EN_PIN);   /* disable PFC */
-            gpio_bit_set(NSI_DIS_GPIO, NSI_DIS_PIN);   /* disable driver */
-            /* stay here; user can reset MCU to clear */
-            break;
-
-        default:
-            g_state = SYS_OFF;
-            break;
         }
 
-        delay_ms(1);
+        delay_ms(OPEN_LOOP_MONITOR_MS);
     }
 }
 
 /* ----- Clock: 120 MHz using HSE+PLL (adjust to your board) ----- */
 static void clock_config(void)
 {
-		ErrStatus ok;
-		rcu_deinit();
+    ErrStatus ok;
+    rcu_deinit();
+
     /* Enable HSE and wait */
     rcu_osci_on(RCU_HXTAL);
-    if (ok != rcu_osci_stab_wait(RCU_HXTAL))
-		{
-			while(1);
-		}
-		fmc_wscnt_set(3);
-		rcu_ahb_clock_config(RCU_AHB_CKSYS_DIV1);
+    ok = rcu_osci_stab_wait(RCU_HXTAL);
+    if (ok != SUCCESS) {
+        while (1) {
+        }
+    }
+    fmc_wscnt_set(3);
+    rcu_ahb_clock_config(RCU_AHB_CKSYS_DIV1);
     rcu_apb2_clock_config(RCU_APB2_CKAHB_DIV1);
     rcu_apb1_clock_config(RCU_APB1_CKAHB_DIV2);
 #if defined(RCU_PLLPRESSEL_HXTAL)
-    rcu_pllpresel_config(RCU_PLLPRESSEL_HXTAL);   /* Ô¤Ñ¡ HXTAL */
+    rcu_pllpresel_config(RCU_PLLPRESSEL_HXTAL);   /* select HXTAL */
 #else
-    rcu_pllpresel_config(RCU_PLLPRESRC_HXTAL);    /* ¾É¿âµÄºêÃû */
+    rcu_pllpresel_config(RCU_PLLPRESRC_HXTAL);    /* fallback */
 #endif
-		
-		rcu_predv0_config(RCU_PREDV0_DIV2);
-		rcu_pll_config(RCU_PLLSRC_HXTAL_IRC48M, RCU_PLL_MUL30);
-		rcu_osci_on(RCU_PLL_CK);
-		 while (rcu_flag_get(RCU_FLAG_PLLSTB) == RESET) { /* µÈ´ý PLL Ëø¶¨ */ }
-		 rcu_system_clock_source_config(RCU_CKSYSSRC_PLL);
-    while (rcu_system_clock_source_get() != RCU_SCSS_PLL) { }
+
+    rcu_predv0_config(RCU_PREDV0_DIV2);
+    rcu_pll_config(RCU_PLLSRC_HXTAL_IRC48M, RCU_PLL_MUL30);
+    rcu_osci_on(RCU_PLL_CK);
+    while (rcu_flag_get(RCU_FLAG_PLLSTB) == RESET) {
+        /* wait for PLL */
+    }
+    rcu_system_clock_source_config(RCU_CKSYSSRC_PLL);
+    while (rcu_system_clock_source_get() != RCU_SCSS_PLL) {
+    }
 
     SystemCoreClock = SYSCLK_HZ;
 }
@@ -246,7 +219,8 @@ static void adc_config(void)
 static uint16_t adc_read_vbus_raw(void)
 {
     adc_software_trigger_enable(ADC0, ADC_REGULAR_CHANNEL);
-    while (!adc_flag_get(ADC0, ADC_FLAG_EOC));
+    while (!adc_flag_get(ADC0, ADC_FLAG_EOC)) {
+    }
     adc_flag_clear(ADC0, ADC_FLAG_EOC);
     return adc_regular_data_read(ADC0);
 }
@@ -267,6 +241,7 @@ static void timer0_pwm_fullbridge_init(uint32_t pwm_hz, uint32_t deadtime_ns, fl
     uint32_t timer_clk = SYSCLK_HZ;
     uint16_t prescaler = 0;
     uint32_t period = (timer_clk / pwm_hz) - 1U;
+    g_timer_period = period;
 
     timer_parameter_struct base = {0};
     timer_deinit(TIMER0);
@@ -279,9 +254,11 @@ static void timer0_pwm_fullbridge_init(uint32_t pwm_hz, uint32_t deadtime_ns, fl
     base.repetitioncounter = 0;
     timer_init(TIMER0, &base);
 
-    /* Deadtime ticks = deadtime_ns / (1e9 / timer_clk) */ //Ó²¼þÊ±¼äÏÞÖÆ
+    /* Deadtime ticks = deadtime_ns / (1e9 / timer_clk) */
     uint32_t dt_ticks = (uint32_t)((deadtime_ns * (uint64_t)timer_clk) / 1000000000ULL);
-    if (dt_ticks > 255) dt_ticks = 255;
+    if (dt_ticks > 255) {
+        dt_ticks = 255;
+    }
 
     timer_break_parameter_struct bk = {0};
     bk.runoffstate      = TIMER_ROS_STATE_ENABLE;
@@ -310,23 +287,59 @@ static void timer0_pwm_fullbridge_init(uint32_t pwm_hz, uint32_t deadtime_ns, fl
     timer_channel_output_shadow_config(TIMER0, TIMER_CH_0, TIMER_OC_SHADOW_DISABLE);
     timer_channel_output_shadow_config(TIMER0, TIMER_CH_1, TIMER_OC_SHADOW_DISABLE);
 
-    uint32_t pulse = (uint32_t)((period + 1U) * duty);
-    timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_0, pulse);
-    timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_1, pulse);
-
-    /* For full-bridge, create 180¡ã phase shift between legs by using channel polarity/inversion if needed
-       (Here we keep both same duty; transformer/LLC determines current via resonance.
-       Advanced: use TIMER DMA/update events to shift phase dynamically.) */
+    timer0_update_duty(duty);
 
     timer_primary_output_config(TIMER0, ENABLE);
     timer_enable(TIMER0);
 }
 
-
 /* crude delay (ms) */
 static void delay_ms(uint32_t ms)
 {
     uint32_t cycles = (SYSCLK_HZ/4000U) * ms; /* approx */
-    for (volatile uint32_t i = 0; i < cycles; ++i) __NOP();
+    for (volatile uint32_t i = 0; i < cycles; ++i) {
+        __NOP();
+    }
 }
 
+static void timer0_update_duty(float duty)
+{
+    if (duty < 0.0f) {
+        duty = 0.0f;
+    } else if (duty > DUTY_MAX_CLAMP) {
+        duty = DUTY_MAX_CLAMP;
+    }
+
+    g_duty = duty;
+
+    uint32_t pulse = (uint32_t)(((float)(g_timer_period + 1U)) * g_duty);
+    if (pulse > g_timer_period) {
+        pulse = g_timer_period;
+    }
+
+    timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_0, pulse);
+    timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_1, pulse);
+}
+
+static void open_loop_softstart(void)
+{
+    uint32_t ctrl_period_us = 0U;
+
+    if (CTRL_TICK_HZ > 0U) {
+        ctrl_period_us = 1000000U / CTRL_TICK_HZ;
+    }
+
+    if (ctrl_period_us == 0U) {
+        ctrl_period_us = 500U;
+    }
+
+    while (g_duty < DUTY_TARGET) {
+        float next = g_duty + DUTY_RAMP_STEP;
+        if (next > DUTY_TARGET) {
+            next = DUTY_TARGET;
+        }
+
+        timer0_update_duty(next);
+        delay_us(ctrl_period_us);
+    }
+}
